@@ -77,9 +77,9 @@ Each API call is stateless. Multi-turn interactions (refining a commit message, 
        ┌───────────┴───────────┐
        │                       │
 ┌──────▼──────┐         ┌──────▼──────┐
-│claude-agent │         │  codex-acp  │
-│    -acp     │         │  (Codex CLI │
-│ (Claude Code│         │   ACP server│
+│ claude-acp  │         │  codex-acp  │
+│ (Claude Code│         │  (Codex CLI │
+│ ACP server) │         │  ACP server)│
 └─────────────┘         └─────────────┘
 ```
 
@@ -93,7 +93,14 @@ App → session-id mappings are stored in `~/.emacs.d/llm-acp-sessions.eld`:
  (default . "uuid-ccc-..."))
 ```
 
-On startup, if a session-id exists for the app, `session/resume` is attempted. On failure (expired session) the entry is cleared and a new session is created transparently.
+On startup, if a session-id exists for the app, `session/resume` is attempted.
+On failure (expired session) the entry is cleared and a new session is created
+transparently.
+
+Important boundary: the persistence key is currently only the app symbol, not
+`(app, cwd)`. That means one app name reuses one ACP session even if it is used
+from different projects/directories. This matches the current implementation,
+but it is weaker isolation than "one project-aware session per app instance".
 
 ### Request lifecycle
 
@@ -121,7 +128,9 @@ llm-acp--pending-register      ; register session-id → callbacks
 
 ### Notification dispatch (single global handler)
 
-One handler is registered per ACP client at creation time. It reads `params.sessionId` from every `session/update` notification and dispatches to the matching entry in `llm-acp--pending`:
+One handler is registered per ACP client at creation time. It reads
+`params.sessionId` from every `session/update` notification and dispatches to
+the matching entry in `llm-acp--pending`:
 
 ```
 notification → method == "session/update"?
@@ -137,6 +146,11 @@ notification → method == "session/update"?
 This ensures:
 - No handler accumulation across requests
 - Correct isolation between concurrent sessions from different apps
+
+Current implementation note: the handler assumes well-formed ACP
+`session/update` payloads. Malformed notifications are not yet wrapped in an
+extra defensive `condition-case`, so this is still an implementation boundary
+rather than a fully hardened guarantee.
 
 ---
 
@@ -176,7 +190,7 @@ This ensures:
 (require 'llm-acp)
 
 ;; Custom ACP server commands (if not on PATH)
-(setq llm-acp-claude-command '("claude-agent-acp"))
+(setq llm-acp-claude-command '("claude-acp"))
 (setq llm-acp-codex-command  '("codex-acp"))
 
 ;; One provider per app
@@ -200,13 +214,13 @@ This ensures:
 |---------|------|
 | `acp.el` (xenodium) | ACP protocol implementation |
 | `llm.el` (ahyatt) | Provider interface |
-| `project.el` | Auto-detect `cwd` from current project |
+| `project.el` (built-in) | Auto-detect `cwd` from current project |
 
 ### External binaries
 
 | Binary | Source | Install |
 |--------|--------|---------|
-| `claude-agent-acp` | [@zed-industries/claude-agent-acp](https://github.com/zed-industries/claude-agent-acp)，Zed 官方维护，Apache-2.0 | `npm install -g @zed-industries/claude-agent-acp` |
+| `claude-acp` | [@zed-industries/claude-agent-acp](https://github.com/zed-industries/claude-agent-acp)，Zed 官方维护，Apache-2.0 | `npm install -g @zed-industries/claude-agent-acp` |
 | `codex-acp` | [zed-industries/codex-acp](https://github.com/zed-industries/codex-acp) | `npm install -g @zed-industries/codex-acp` |
 
 ---
@@ -218,6 +232,8 @@ This ensures:
 - **No tool-use passthrough**: `llm.el`'s tool-call interface is not yet mapped to ACP tool calls. Packages using tools (function calling) will not work.
 - **`llm-chat` (sync) not implemented**: Synchronous chat would block Emacs; callers should use `llm-chat-async` or `llm-chat-streaming`.
 - **Authentication**: Only pre-authenticated agents are supported (i.e., `claude` and `codex` must already be logged in via their own CLIs). The optional ACP `authenticate` step is not yet implemented.
+- **Session reuse is app-scoped, not cwd-scoped**: session persistence keys only by app symbol. Reusing the same app symbol across multiple projects currently reuses the same ACP session.
+- **ACP init failure handling is still minimal**: initialization failures are surfaced via `message`, but there is not yet a richer user-facing recovery model for queued callers.
 - **Prompt history**: Only the latest user message is forwarded to the agent. The ACP session owns conversation history on the agent side — this is by design. Session state survives Emacs restarts via persisted session-id and `session/resume`. The only case where history is lost is when a session genuinely expires on the agent side, triggering a transparent `session/new`.
 
 ### Future work
