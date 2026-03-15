@@ -77,9 +77,9 @@ Each API call is stateless. Multi-turn interactions (refining a commit message, 
        ┌───────────┴───────────┐
        │                       │
 ┌──────▼──────┐         ┌──────▼──────┐
-│ claude-acp  │         │  codex-acp  │
-│ (Claude Code│         │  (Codex CLI │
-│  ACP server)│         │   ACP server│
+│claude-agent │         │  codex-acp  │
+│    -acp     │         │  (Codex CLI │
+│ (Claude Code│         │   ACP server│
 └─────────────┘         └─────────────┘
 ```
 
@@ -176,7 +176,7 @@ This ensures:
 (require 'llm-acp)
 
 ;; Custom ACP server commands (if not on PATH)
-(setq llm-acp-claude-command '("claude-acp"))
+(setq llm-acp-claude-command '("claude-agent-acp"))
 (setq llm-acp-codex-command  '("codex-acp"))
 
 ;; One provider per app
@@ -204,10 +204,10 @@ This ensures:
 
 ### External binaries
 
-| Binary | Source |
-|--------|--------|
-| `claude-acp` | Claude Code with ACP support |
-| `codex-acp` | [zed-industries/codex-acp](https://github.com/zed-industries/codex-acp) |
+| Binary | Source | Install |
+|--------|--------|---------|
+| `claude-agent-acp` | [@zed-industries/claude-agent-acp](https://github.com/zed-industries/claude-agent-acp)，Zed 官方维护，Apache-2.0 | `npm install -g @zed-industries/claude-agent-acp` |
+| `codex-acp` | [zed-industries/codex-acp](https://github.com/zed-industries/codex-acp) | `npm install -g @zed-industries/codex-acp` |
 
 ---
 
@@ -218,7 +218,7 @@ This ensures:
 - **No tool-use passthrough**: `llm.el`'s tool-call interface is not yet mapped to ACP tool calls. Packages using tools (function calling) will not work.
 - **`llm-chat` (sync) not implemented**: Synchronous chat would block Emacs; callers should use `llm-chat-async` or `llm-chat-streaming`.
 - **Authentication**: Only pre-authenticated agents are supported (i.e., `claude` and `codex` must already be logged in via their own CLIs). The optional ACP `authenticate` step is not yet implemented.
-- **Prompt history**: Only the latest user message is forwarded to the agent. The ACP session owns history on the agent side. This is correct for session-continuous use but means cold-start sessions lack the prior turns that `llm.el` callers may have built up.
+- **Prompt history**: Only the latest user message is forwarded to the agent. The ACP session owns conversation history on the agent side — this is by design. Session state survives Emacs restarts via persisted session-id and `session/resume`. The only case where history is lost is when a session genuinely expires on the agent side, triggering a transparent `session/new`.
 
 ### Future work
 
@@ -229,4 +229,4 @@ This ensures:
 | Per-app model configuration | Low |
 | ACP `authenticate` step for agents requiring login | Low |
 | Expose agent thought-process chunks as a separate callback | Low |
-| Multi-turn cold-start: replay `llm-chat-prompt` history on new session | Medium |
+| Replay `llm-chat-prompt` history when a session expires and a new one is created | Low |
