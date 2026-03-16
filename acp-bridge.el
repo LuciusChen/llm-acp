@@ -553,6 +553,70 @@ ON-ERROR      Called with (kind msg) on failure."
                         (in-buf on-tool-call) (in-buf on-request)
                         (in-buf on-done) (in-buf on-error)))))
 
+;;; ── ergonomic helpers ────────────────────────────────────────────────────────
+
+;;;###autoload
+(cl-defun acp-bridge-query (message &rest args)
+  "Single-turn ACP request.  Like `acp-bridge-request' with :new-session t.
+
+Useful for one-shot calls (e.g. generating a commit message) where each
+invocation must start from a clean slate.  All keyword arguments accepted
+by `acp-bridge-request' are forwarded; :new-session t is always set."
+  (apply #'acp-bridge-request message :new-session t args))
+
+(defun acp-bridge--json-system-prompt (extra)
+  "Return a system prompt requiring JSON output, with optional EXTRA appended."
+  (concat "Respond with valid JSON only. No markdown code fences, no prose."
+          (when extra (concat "\n" extra))))
+
+(defun acp-bridge--json-done-handler (on-done on-error)
+  "Wrap ON-DONE to JSON-parse the response text before calling it.
+Calls ON-ERROR with (\\='json-parse-error msg) if parsing fails."
+  (when on-done
+    (lambda (text)
+      (condition-case err
+          (funcall on-done
+                   (json-parse-string (string-trim text)
+                                      :object-type 'alist
+                                      :array-type  'list))
+        (error
+         (when on-error
+           (funcall on-error 'json-parse-error
+                    (format "JSON parse failed: %s"
+                            (error-message-string err)))))))))
+
+;;;###autoload
+(cl-defun acp-bridge-query-json (message
+                                  &key
+                                  (agent        :claude)
+                                  (app          'acp-bridge)
+                                  cwd
+                                  system-prompt
+                                  mcp-servers
+                                  on-chunk
+                                  on-event
+                                  on-tool-call
+                                  on-request
+                                  on-done
+                                  on-error)
+  "Single-turn ACP request; :on-done receives a parsed JSON alist.
+
+Like `acp-bridge-query' but prepends a JSON-only instruction to SYSTEM-PROMPT
+and parses the final text as JSON before passing it to ON-DONE.
+On parse failure, calls ON-ERROR with (\\='json-parse-error msg)."
+  (acp-bridge-query message
+    :agent        agent
+    :app          app
+    :cwd          cwd
+    :system-prompt (acp-bridge--json-system-prompt system-prompt)
+    :mcp-servers  mcp-servers
+    :on-chunk     on-chunk
+    :on-event     on-event
+    :on-tool-call on-tool-call
+    :on-request   on-request
+    :on-done      (acp-bridge--json-done-handler on-done on-error)
+    :on-error     on-error))
+
 ;;; ── interactive session management ──────────────────────────────────────────
 
 (defun acp-bridge--read-session-key ()

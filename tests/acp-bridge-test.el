@@ -861,6 +861,92 @@ acp-fakes' inline dispatch reaches acp-bridge handlers."
       (should sent-response)
       (should (map-elt (plist-get sent-response :response) :error)))))
 
+;;; ── ergonomic helpers ────────────────────────────────────────────────────────
+
+(ert-deftest acp-bridge-test-query-always-new-session ()
+  "acp-bridge-query always starts a fresh session, ignoring any stored one."
+  (acp-bridge-test--with-clean-state
+    ;; Pre-seed a stored session; query should ignore it and create a new one
+    (acp-bridge--session-set 'test-app "/tmp/test-project" :claude "sid-old")
+    (acp-bridge-test--inject-agent :claude
+                                   (acp-fakes-make-client
+                                    acp-bridge-test--new-session-messages))
+    (let ((completed nil))
+      (acp-bridge-query "hi"
+        :app 'test-app
+        :cwd "/tmp/test-project"
+        :on-done  (lambda (text) (setq completed text))
+        :on-error (lambda (_k _m) (error "unexpected error")))
+      (should (equal completed "Hello world"))
+      ;; New session-id replaces the old one
+      (should (equal (acp-bridge--session-get 'test-app "/tmp/test-project")
+                     '(:claude . "sid-A"))))))
+
+(defvar acp-bridge-test--json-session-messages
+  `(((:direction . outgoing) (:kind . request)
+     (:object . ((id . 1) (method . "session/new"))))
+    ((:direction . incoming) (:kind . response)
+     (:object . ((id . 1) (result . ((sessionId . "sid-J"))))))
+    ((:direction . outgoing) (:kind . request)
+     (:object . ((id . 2) (method . "session/prompt"))))
+    ((:direction . incoming) (:kind . notification)
+     (:object . ((method . "session/update")
+                 (params . ((sessionId . "sid-J")
+                            (update . ((sessionUpdate . "agent_message_chunk")
+                                       (content . ((text . "{\"answer\":"))))))))))
+    ((:direction . incoming) (:kind . notification)
+     (:object . ((method . "session/update")
+                 (params . ((sessionId . "sid-J")
+                            (update . ((sessionUpdate . "agent_message_chunk")
+                                       (content . ((text . "42}"))))))))))
+    ((:direction . incoming) (:kind . response)
+     (:object . ((id . 2) (result . nil))))))
+
+(ert-deftest acp-bridge-test-query-json-success ()
+  "acp-bridge-query-json: :on-done receives a parsed alist."
+  (acp-bridge-test--with-clean-state
+    (acp-bridge-test--inject-agent :claude
+                                   (acp-fakes-make-client
+                                    acp-bridge-test--json-session-messages))
+    (let (result)
+      (acp-bridge-query-json "what is the answer?"
+        :app 'test-app
+        :cwd "/tmp/test-project"
+        :on-done  (lambda (data) (setq result data))
+        :on-error (lambda (_k _m) (error "unexpected error")))
+      (should (equal (map-elt result 'answer) 42)))))
+
+(defvar acp-bridge-test--json-bad-messages
+  `(((:direction . outgoing) (:kind . request)
+     (:object . ((id . 1) (method . "session/new"))))
+    ((:direction . incoming) (:kind . response)
+     (:object . ((id . 1) (result . ((sessionId . "sid-JB"))))))
+    ((:direction . outgoing) (:kind . request)
+     (:object . ((id . 2) (method . "session/prompt"))))
+    ((:direction . incoming) (:kind . notification)
+     (:object . ((method . "session/update")
+                 (params . ((sessionId . "sid-JB")
+                            (update . ((sessionUpdate . "agent_message_chunk")
+                                       (content . ((text . "not json at all"))))))))))
+    ((:direction . incoming) (:kind . response)
+     (:object . ((id . 2) (result . nil))))))
+
+(ert-deftest acp-bridge-test-query-json-parse-error ()
+  "acp-bridge-query-json: :on-error called with json-parse-error when response is not JSON."
+  (acp-bridge-test--with-clean-state
+    (acp-bridge-test--inject-agent :claude
+                                   (acp-fakes-make-client
+                                    acp-bridge-test--json-bad-messages))
+    (let (error-kind error-msg)
+      (acp-bridge-query-json "what is the answer?"
+        :app 'test-app
+        :cwd "/tmp/test-project"
+        :on-done  (lambda (_data) (error "should not succeed"))
+        :on-error (lambda (kind msg)
+                    (setq error-kind kind error-msg msg)))
+      (should (eq error-kind 'json-parse-error))
+      (should (stringp error-msg)))))
+
 ;;; ── robustness: malformed notification ───────────────────────────────────────
 
 (ert-deftest acp-bridge-test-notification-handler-malformed ()

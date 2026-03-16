@@ -290,6 +290,12 @@ Acceptance:
 2. JSON-oriented callers have a supported path above the transport layer.
 3. The public API remains ACP-native and smaller than a full provider abstraction.
 
+Status: **complete**
+
+- `acp-bridge-query`: thin wrapper over `acp-bridge-request` with `:new-session t`
+- `acp-bridge-query-json`: single-turn with JSON system prompt and auto-parsed `:on-done`
+- Both functions are autoloaded and documented
+
 ## Dependencies
 
 | Package | Role |

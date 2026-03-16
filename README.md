@@ -67,14 +67,19 @@ Then:
 ## Programmatic API
 
 ```elisp
-;; single-turn request
-(acp-bridge-request diff-text
+;; single-turn (acp-bridge-query always starts a fresh session)
+(acp-bridge-query diff-text
   :app 'magit
-  :new-session t
   :system-prompt "Conventional Commits format only."
   :on-done (lambda (text) (insert text)))
 
-;; session-backed request
+;; single-turn JSON response
+(acp-bridge-query-json "Extract the ticket number from this commit message: ..."
+  :app 'my-tool
+  :on-done  (lambda (data) (map-elt data 'ticket))
+  :on-error (lambda (kind msg) (message "Error: %s %s" kind msg)))
+
+;; session-backed multi-turn
 (acp-bridge-request "Summarize the section"
   :app 'org
   :on-chunk (lambda (text) ...)
@@ -84,7 +89,36 @@ Then:
   :on-done  (lambda (_) nil))
 ```
 
-Full signature:
+### `acp-bridge-query` — single-turn helper
+
+Always starts a fresh session (`:new-session t`).  Accepts the same keyword
+arguments as `acp-bridge-request`.
+
+```elisp
+(acp-bridge-query "Generate a changelog entry for this diff"
+  :app          'changelog
+  :system-prompt "Return plain text, one paragraph, no bullet points."
+  :on-done      (lambda (text) (insert text)))
+```
+
+### `acp-bridge-query-json` — single-turn with JSON parsing
+
+Like `acp-bridge-query` but prepends a JSON-only instruction to the system
+prompt and delivers a parsed alist to `:on-done`.
+
+```elisp
+(acp-bridge-query-json "What is the sentiment of this review text?"
+  :app      'my-tool
+  :on-done  (lambda (data)
+              (message "Sentiment: %s" (map-elt data 'sentiment)))
+  :on-error (lambda (kind msg)
+              (message "Failed (%s): %s" kind msg)))
+```
+
+`:on-error` is called with `('json-parse-error msg)` when the agent response
+cannot be parsed as JSON.
+
+### Full `acp-bridge-request` signature
 
 ```elisp
 (acp-bridge-request message
@@ -251,8 +285,8 @@ Near-term work for broader API-replacement scenarios:
 - [x] Expose `:mcp-servers` in `acp-bridge-request`
 - [x] Expose `acp-bridge-fs-read-capability` and `acp-bridge-fs-write-capability`
 - [x] Auto-handle `fs/read_text_file`; surface `fs/write_text_file` to caller
-- [ ] Add a clearer single-turn helper for fresh-session requests
-- [ ] Add optional helpers for JSON-only / structured-output flows
+- [x] Add `acp-bridge-query` single-turn helper
+- [x] Add `acp-bridge-query-json` for JSON-response flows
 
 ## License
 
