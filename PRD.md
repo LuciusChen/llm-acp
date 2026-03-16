@@ -1,248 +1,320 @@
-# llm-acp — Product Requirements Document
+# acp-bridge — Product Requirements Document
 
 ## Overview
 
-`llm-acp` is an Emacs Lisp package that exposes Claude Code and Codex CLI as an [`llm.el`](https://github.com/ahyatt/llm) provider via the [Agent Client Protocol (ACP)](https://agentclientprotocol.com).
+`acp-bridge` is an Emacs Lisp package that provides a small, headless ACP bridge for Claude Code and Codex CLI.
 
-Any Emacs package that already uses `llm.el` as its backend (ellama, magit-gptcommit, gptel-aibo, etc.) can switch to `llm-acp` and immediately start using Claude Code or Codex tokens — with no API key management and with full project context available to the agent.
+Its primary job is to let Elisp callers send prompts through ACP, reuse agent-side project context and sessions, and receive streaming text responses without depending on HTTP model APIs.
 
----
+`acp-bridge` is not a chat application. Interactive chat should live in a separate frontend such as `agent-shell`. This package owns the transport, session, and request lifecycle layer.
+
+## Product Positioning
+
+### What it is
+
+- A callable Elisp API for ACP-backed requests
+- A session manager keyed by `(app, project)`
+- A thin bridge over `acp.el`
+- A foundation for replacing some local "model API" usage patterns inside Emacs
+
+### What it is not
+
+- A dedicated chat UI
+- An `llm.el` provider
+- A `gptel` backend
+- A drop-in replacement for remote model APIs in backend/server environments
 
 ## Problem
 
-### Duplicate token spend
+Elisp callers that want AI assistance currently face an awkward choice:
 
-Users who subscribe to Claude Code or Codex CLI pay for those tokens. When they use Emacs packages like ellama or magit-gptcommit, those packages make separate API calls (requiring a separate API key and billing account), effectively paying twice for the same capability.
+1. Call model HTTP APIs directly and rebuild prompt context, project context, auth, and streaming logic locally.
+2. Use a chat-oriented frontend that is optimized for interaction, not for small programmatic calls.
+3. Integrate with `llm.el`/`gptel`, which are shaped around HTTP provider abstractions rather than ACP's stdio and session model.
 
-### No project context
+For callers already living inside Emacs, and for users already using Claude Code or Codex, there is a simpler need:
 
-Raw API calls send only what the package explicitly includes in the prompt. Claude Code and Codex, by contrast, can read the entire repository, git history, and surrounding files. A commit-message generator backed by a raw API call sees only the diff; one backed by Claude Code can reason about the whole codebase.
-
-### Fragmented session state
-
-Each API call is stateless. Multi-turn interactions (refining a commit message, iterating on a code review) require the client to manually rebuild and re-send history. ACP sessions maintain state natively on the agent side.
-
----
+- send a string
+- get streamed text / final text back
+- optionally reuse the current ACP session for the current project
 
 ## Goals
 
 | # | Goal |
 |---|------|
-| G1 | Let any `llm.el`-consuming package use Claude Code or Codex as its backend |
-| G2 | One persistent ACP session per application symbol, surviving Emacs restarts |
-| G3 | Stream tokens to the caller as they arrive (no waiting for full response) |
-| G4 | Zero duplicate initialization — one ACP client process per agent type, shared across all apps |
-| G5 | Safe concurrent use — multiple packages can be active simultaneously without interfering |
-
----
+| G1 | Provide a stable `acp-bridge-request` API for Elisp callers |
+| G2 | Reuse one ACP client process per agent type |
+| G3 | Persist one ACP session per `(app, context)` pair |
+| G4 | Stream plain-text responses with minimal caller ceremony |
+| G5 | Keep the package independent from `llm.el`, `gptel`, and chat-buffer concerns |
+| G6 | Evolve toward broader API-replacement scenarios without abandoning ACP-native semantics |
 
 ## Non-Goals
 
-- Providing a chat UI (that is `agent-shell`'s job)
-- Supporting ACP agents other than Claude Code and Codex (though the architecture is agent-agnostic)
-- Replacing `gptel` or `llm.el` — this is a provider for them, not a competitor
-- Tool-use / function-calling passthrough to `llm.el` (future work)
+- Dedicated chat UI
+- `llm.el` compatibility
+- `gptel` compatibility
+- General backend/service API replacement outside Emacs
+- Supporting arbitrary ACP agents beyond Claude Code and Codex
 
----
+## Current Requirements
+
+### Functional
+
+1. `acp-bridge-request` sends a string prompt and accepts callbacks for chunk, done, and error.
+2. The request API may also expose raw ACP session events to callers.
+3. The request API supports:
+   - `agent`
+   - `app`
+   - `cwd`
+   - `system-prompt`
+   - `new-session`
+   - `on-event`
+   - `on-tool-call`
+   - `on-request`
+4. Sessions are persisted by `(app . context) -> (agent . session-id)`.
+5. Expired sessions are handled by removing the stale session ID and creating a new ACP session.
+6. One notification handler is registered per ACP client and dispatches per `sessionId`.
+7. ACP permission requests are surfaced to callers and can be answered from Emacs.
+8. Interactive commands exist only for session inspection/control:
+   - `acp-bridge-new-session`
+   - `acp-bridge-delete-session`
+   - `acp-bridge-cancel-session`
+   - `acp-bridge-set-model`
+
+### Non-Functional
+
+1. No process is started on package load.
+2. Initialization is shared across callers for the same agent.
+3. Session persistence survives Emacs restarts.
+4. The API remains small and string-oriented until richer event support is justified.
 
 ## Architecture
 
-### Component overview
+### Component Overview
 
-```
-┌─────────────────────────────────────────────────────┐
-│  Emacs packages using llm.el                        │
-│  (ellama, magit-gptcommit, gptel-aibo, …)           │
-└──────────────────┬──────────────────────────────────┘
-                   │  llm-chat-async / llm-chat-streaming
-┌──────────────────▼──────────────────────────────────┐
-│  llm-acp.el  (this package)                         │
-│                                                     │
-│  ┌─────────────┐   ┌──────────────────────────────┐ │
-│  │ llm-acp     │   │ llm-acp--agents hash table   │ │
-│  │ struct      │   │  :claude → agent-entry        │ │
-│  │ :agent      │   │  :codex  → agent-entry        │ │
-│  │ :app        │   │                              │ │
-│  │ :cwd        │   │ Each entry:                  │ │
-│  └─────────────┘   │  :client  acp-client         │ │
-│                    │  :state   :uninitialized      │ │
-│  ┌─────────────┐   │           :initializing       │ │
-│  │ pending     │   │           :ready              │ │
-│  │ hash table  │   │  :queue   [thunk …]           │ │
-│  │ session-id  │   └──────────────────────────────┘ │
-│  │  → entry    │                                     │
-│  └─────────────┘                                     │
-└──────────────────┬──────────────────────────────────┘
-                   │  ACP (JSON-RPC over stdio)
-       ┌───────────┴───────────┐
-       │                       │
-┌──────▼──────┐         ┌──────▼──────┐
-│ claude-acp  │         │  codex-acp  │
-│ (Claude Code│         │  (Codex CLI │
-│ ACP server) │         │  ACP server)│
-└─────────────┘         └─────────────┘
+```text
+Elisp callers
+  -> acp-bridge-request
+  -> acp-bridge session lookup / lifecycle
+  -> acp.el client
+  -> claude-agent-acp / codex-acp
 ```
 
-### Session persistence
+### State
 
-App → session-id mappings are stored in `~/.emacs.d/llm-acp-sessions.eld`:
+- `acp-bridge--agents`: one live ACP client per agent type
+- `acp-bridge--pending`: in-flight request table keyed by `session-id`
+- `acp-bridge--sessions-cache`: persisted `(app . context)` session mapping cache
+
+### Request Lifecycle
+
+```text
+acp-bridge-request
+  -> compute context
+  -> optionally clear stored session if new-session
+  -> ensure ACP client initialized
+  -> if stored session exists: session/resume
+  -> on resume failure: drop stored session and session/new
+  -> session/prompt
+  -> session/update agent_message_chunk => on-chunk
+  -> prompt success => on-done
+  -> prompt failure / agent error => on-error
+```
+
+## Public API
 
 ```elisp
-((magit   . "uuid-aaa-...")
- (ellama  . "uuid-bbb-...")
- (default . "uuid-ccc-..."))
+(acp-bridge-request message
+  &key
+  (agent        :claude)
+  (app          'acp-bridge)
+  cwd
+  system-prompt
+  new-session
+  on-chunk
+  on-event
+  on-tool-call
+  on-request
+  on-done
+  on-error)
 ```
 
-On startup, if a session-id exists for the app, `session/resume` is attempted.
-On failure (expired session) the entry is cleared and a new session is created
-transparently.
+### Usage Patterns
 
-Important boundary: the persistence key is currently only the app symbol, not
-`(app, cwd)`. That means one app name reuses one ACP session even if it is used
-from different projects/directories. This matches the current implementation,
-but it is weaker isolation than "one project-aware session per app instance".
-
-### Request lifecycle
-
-```
-llm-acp--send
-  ↓
-llm-acp--ensure-ready          ; init state machine
-  :uninitialized → create client, subscribe global handler, send initialize
-  :initializing  → push thunk onto queue
-  :ready         → call thunk immediately
-  ↓
-session exists?
-  yes → session/resume → session/prompt
-  no  → session/new → save session-id → session/prompt
-  ↓
-llm-acp--pending-register      ; register session-id → callbacks
-  ↓
-(concurrent paths)
-  notification handler          session/prompt on-success
-  session/update arrives    →   fires complete-cb with final text
-  agent_message_chunk       →
-  llm-acp--pending-append   →
-  calls partial-cb
-```
-
-### Notification dispatch (single global handler)
-
-One handler is registered per ACP client at creation time. It reads
-`params.sessionId` from every `session/update` notification and dispatches to
-the matching entry in `llm-acp--pending`:
-
-```
-notification → method == "session/update"?
-                 ↓ yes
-               params.sessionId → lookup in llm-acp--pending
-                 ↓
-               sessionUpdate == "agent_message_chunk"
-                 → pending-append: accumulate + call :partial
-               sessionUpdate == "agent_error"
-                 → pending-error: call :error
-```
-
-This ensures:
-- No handler accumulation across requests
-- Correct isolation between concurrent sessions from different apps
-
-Current implementation note: the handler assumes well-formed ACP
-`session/update` payloads. Malformed notifications are not yet wrapped in an
-extra defensive `condition-case`, so this is still an implementation boundary
-rather than a fully hardened guarantee.
-
----
-
-## API
-
-### Struct
+Single-turn, stateless-ish request:
 
 ```elisp
-(llm-acp-make
-  :agent :claude   ; or :codex
-  :app   'magit    ; any symbol; determines which session is reused
-  :cwd   nil)      ; nil = auto-detect from (project-current)
+(acp-bridge-request prompt
+  :app 'magit
+  :new-session t
+  :on-done (lambda (text) ...))
 ```
 
-### Implemented llm.el methods
-
-| Method | Notes |
-|--------|-------|
-| `llm-name` | Returns e.g. `"Claude/ACP[magit]"` |
-| `llm-capabilities` | Returns `'(streaming)` |
-| `llm-chat-token-limit` | Returns 200000 |
-| `llm-chat-async` | Full response via callback |
-| `llm-chat-streaming` | Chunk-by-chunk partial callback + final callback |
-
-### Interactive commands
-
-| Command | Description |
-|---------|-------------|
-| `llm-acp-new-session` | Clear stored session; next send starts fresh |
-| `llm-acp-delete-session` | Send `session/delete` to agent, then clear |
-
----
-
-## Configuration
+Session-backed request:
 
 ```elisp
-(require 'llm-acp)
-
-;; Custom ACP server commands (if not on PATH)
-(setq llm-acp-claude-command '("claude-acp"))
-(setq llm-acp-codex-command  '("codex-acp"))
-
-;; One provider per app
-(setq ellama-provider
-      (llm-acp-make :agent :claude :app 'ellama))
-
-(setq magit-gptcommit-llm-provider
-      (llm-acp-make :agent :claude :app 'magit))
-
-;; Different apps can use different agents
-(setq my-review-provider
-      (llm-acp-make :agent :codex :app 'review
-                    :cwd "/path/to/project"))
+(acp-bridge-request "Summarize the section"
+  :app 'org
+  :on-chunk (lambda (text) ...)
+  :on-done  (lambda (text) ...))
 ```
 
----
+## Limits of the Current API
+
+The current public API is intentionally narrow. It exposes:
+
+- text in
+- streamed text out
+- raw `session/update` params out
+- merged tool-call state out
+- permission requests out
+- final text out
+- errors
+
+It does not yet expose:
+
+- MCP server configuration
+- structured output contracts
+- explicit stateless request mode beyond "start a fresh session"
+
+This is acceptable for the current scope, but it is the main gap between `acp-bridge` and a fuller "API replacement layer".
+
+## API Replacement Roadmap
+
+To support more API-like use cases inside Emacs, the next iteration should add:
+
+### R1. Event passthrough
+
+Expose richer ACP events to callers, not just text chunks. This includes:
+
+- normalized tool-call events
+- permission requests
+- possibly additional raw ACP payloads beyond the current surface
+
+### R2. Host capabilities
+
+Expose ACP client capabilities and related handlers, especially:
+
+- file-system capabilities
+- permission handling
+- MCP server configuration
+
+### R3. Better request modes
+
+Support clearer request semantics for callers who need:
+
+- fresh-session execution
+- reproducible prompts
+- explicit per-request settings
+
+### R4. Structured helpers
+
+Add optional helpers for:
+
+- extracting final assistant text
+- JSON-only flows
+- response post-processing
+
+These should be layered above the ACP bridge, not baked into the transport core.
+
+## Delivery Plan
+
+### Phase 1 — Event Passthrough MVP
+
+Scope:
+
+- add request-level `:on-event` callback
+- add merged tool-call state callback
+- forward raw ACP `session/update` payloads
+- handle ACP incoming requests relevant to request execution, especially permission requests
+
+Acceptance:
+
+1. A caller can observe more than plain text chunks during a request.
+2. Tool-related ACP updates can be logged or handled by the caller when exposed by the agent.
+3. Permission requests are surfaced instead of disappearing inside the bridge.
+
+Status:
+
+- request-level `:on-event` implemented
+- merged tool-call state surfaced via `:on-tool-call`
+- `session/request_permission` surfaced via `:on-request`
+
+Remaining work before closing Phase 1:
+
+1. Stabilize the event model across `:on-event`, `:on-tool-call`, and `:on-request`.
+2. Add broader tool-call lifecycle coverage:
+   - multiple concurrent `toolCallId`s
+   - partial updates with missing fields
+   - failed / cancelled terminal states
+   - late-arriving `content` / `rawOutput`
+3. Document the intended caller boundary:
+   - use `:on-event` for raw ACP access
+   - use `:on-tool-call` / `:on-request` for normalized integration
+
+Phase 2 should begin only after these behaviors are explicit and covered by tests.
+
+### Phase 2 — Host Capability Surface
+
+Scope:
+
+- expose client capability configuration
+- expose `mcpServers` in session creation/resume paths
+- define the public API boundary for host-side ACP participation
+
+Acceptance:
+
+1. A caller can opt into ACP capabilities without patching internals.
+2. MCP server wiring is available from the public API.
+3. README examples cover at least one richer-than-text request flow.
+
+Entry criteria:
+
+1. Phase 1 event callbacks are stable enough that Phase 2 does not need to redesign them.
+2. Tool-call and permission handling semantics are documented and test-covered.
+
+### Phase 3 — API Ergonomics
+
+Scope:
+
+- add clearer single-turn helpers
+- add optional structured-output helpers
+- reduce ceremony for common "replace direct API call" use cases
+
+Acceptance:
+
+1. Single-turn usage does not require repeated keyword boilerplate.
+2. JSON-oriented callers have a supported path above the transport layer.
+3. The public API remains ACP-native and smaller than a full provider abstraction.
 
 ## Dependencies
 
 | Package | Role |
 |---------|------|
-| `acp.el` (xenodium) | ACP protocol implementation |
-| `llm.el` (ahyatt) | Provider interface |
-| `project.el` (built-in) | Auto-detect `cwd` from current project |
+| `acp.el` | ACP transport and JSON-RPC implementation |
+| `project.el` | Project root detection |
+| `map.el` | JSON/object access helpers |
 
-### External binaries
+### External Binaries
 
-| Binary | Source | Install |
-|--------|--------|---------|
-| `claude-acp` | [@zed-industries/claude-agent-acp](https://github.com/zed-industries/claude-agent-acp)，Zed 官方维护，Apache-2.0 | `npm install -g @zed-industries/claude-agent-acp` |
-| `codex-acp` | [zed-industries/codex-acp](https://github.com/zed-industries/codex-acp) | `npm install -g @zed-industries/codex-acp` |
+| Binary | Install |
+|--------|---------|
+| `claude-agent-acp` | `npm install -g @zed-industries/claude-agent-acp` |
+| `codex-acp` | `npm install -g @zed-industries/codex-acp` |
 
----
+## Known Limitations
 
-## Known Limitations & Future Work
+- Only pre-authenticated agents are supported
+- General ACP request passthrough beyond permission handling is not implemented
+- API callers receive limited structured callbacks; richer ACP surface is still incomplete
+- Session reuse is ACP-native, not an exact match for stateless model API semantics
+- There is no public configuration surface yet for `mcpServers` or client capabilities
 
-### Current limitations
+## Success Criteria
 
-- **No tool-use passthrough**: `llm.el`'s tool-call interface is not yet mapped to ACP tool calls. Packages using tools (function calling) will not work.
-- **`llm-chat` (sync) not implemented**: Synchronous chat would block Emacs; callers should use `llm-chat-async` or `llm-chat-streaming`.
-- **Authentication**: Only pre-authenticated agents are supported (i.e., `claude` and `codex` must already be logged in via their own CLIs). The optional ACP `authenticate` step is not yet implemented.
-- **Session reuse is app-scoped, not cwd-scoped**: session persistence keys only by app symbol. Reusing the same app symbol across multiple projects currently reuses the same ACP session.
-- **ACP init failure handling is still minimal**: initialization failures are surfaced via `message`, but there is not yet a richer user-facing recovery model for queued callers.
-- **Prompt history**: Only the latest user message is forwarded to the agent. The ACP session owns conversation history on the agent side — this is by design. Session state survives Emacs restarts via persisted session-id and `session/resume`. The only case where history is lost is when a session genuinely expires on the agent side, triggering a transparent `session/new`.
+`acp-bridge` is successful if:
 
-### Future work
-
-| Item | Priority |
-|------|----------|
-| Tool-use / function-call passthrough | Medium |
-| `session/set-model` support (switch model mid-session) | Low |
-| Per-app model configuration | Low |
-| ACP `authenticate` step for agents requiring login | Low |
-| Expose agent thought-process chunks as a separate callback | Low |
-| Replay `llm-chat-prompt` history when a session expires and a new one is created | Low |
+1. Emacs packages can replace ad hoc direct model API calls with `acp-bridge-request`.
+2. Users can reuse Claude Code / Codex project context without building custom chat frontends.
+3. The package stays small and ACP-native while still growing toward richer event passthrough where it materially improves caller ergonomics.
