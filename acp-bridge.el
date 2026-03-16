@@ -707,6 +707,12 @@ This is a claude-code-acp extension; it has no effect on Codex sessions."
 
 ;;; ── built-in callers ─────────────────────────────────────────────────────────
 
+(defcustom acp-bridge-commit-agent :claude
+  "Agent used by `acp-bridge-commit'."
+  :type '(choice (const :tag "Claude Code" :claude)
+                 (const :tag "Codex" :codex))
+  :group 'acp-bridge)
+
 (defconst acp-bridge-conventional-commits-prompt
   "The user provides the result of running `git diff --cached`. You suggest a conventional commit message. Don't add anything else to the response.
 
@@ -731,6 +737,7 @@ feat correlates with MINOR, fix with PATCH, BREAKING CHANGE with MAJOR in SemVer
     (when (string-empty-p diff)
       (user-error "No staged changes"))
     (acp-bridge-query diff
+      :agent        acp-bridge-commit-agent
       :app          'acp-bridge-commit
       :system-prompt acp-bridge-conventional-commits-prompt
       :on-done      (lambda (text) (insert (string-trim text)))
