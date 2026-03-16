@@ -174,7 +174,6 @@ The current public API is intentionally narrow. It exposes:
 
 It does not yet expose:
 
-- MCP server configuration
 - structured output contracts
 - explicit stateless request mode beyond "start a fresh session"
 
@@ -269,10 +268,13 @@ Acceptance:
 2. MCP server wiring is available from the public API.
 3. README examples cover at least one richer-than-text request flow.
 
-Entry criteria:
+Status: **complete**
 
-1. Phase 1 event callbacks are stable enough that Phase 2 does not need to redesign them.
-2. Tool-call and permission handling semantics are documented and test-covered.
+- `:mcp-servers` added to `acp-bridge-request`; forwarded to `session/new` and `session/resume`
+- `acp-bridge-fs-read-capability` and `acp-bridge-fs-write-capability` defcustoms declared in `initialize`
+- `fs/read_text_file` auto-handled by the bridge (Emacs file I/O)
+- `fs/write_text_file` surfaced to caller via `:on-request`; auto-rejected when no handler
+- README updated with MCP server and fs capability examples
 
 ### Phase 3 — API Ergonomics
 
@@ -309,7 +311,7 @@ Acceptance:
 - General ACP request passthrough beyond permission handling is not implemented
 - API callers receive limited structured callbacks; richer ACP surface is still incomplete
 - Session reuse is ACP-native, not an exact match for stateless model API semantics
-- There is no public configuration surface yet for `mcpServers` or client capabilities
+- `fs/write_text_file` auto-write path (without `:on-request`) is not implemented
 
 ## Success Criteria
 

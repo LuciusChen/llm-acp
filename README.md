@@ -15,22 +15,23 @@ It does not provide a dedicated chat UI. For interactive chat, use a separate fr
 
 ## Current Scope
 
-Implemented today:
+Implemented:
 
 - `acp-bridge-request` programmatic API
 - One ACP client process per agent type (`:claude`, `:codex`)
 - One persisted session per `(app, project)` pair
-- Streaming text chunks via callback
+- Streaming text chunks via `:on-chunk`
 - Raw ACP `session/update` events via `:on-event`
-- Structured tool-call state via `:on-tool-call`
+- Structured tool-call state via `:on-tool-call` (concurrent calls, all terminal states)
 - ACP permission requests via `:on-request`
 - Session lifecycle commands: new, delete, cancel, set model
 - Recovery from expired sessions by creating a new session
+- `:mcp-servers` forwarded to `session/new` and `session/resume`
+- `acp-bridge-fs-read-capability`: auto-serve `fs/read_text_file` requests from the agent
+- `acp-bridge-fs-write-capability`: surface `fs/write_text_file` requests to `:on-request`
 
 Not implemented yet:
 
-- General function-call / host-tool passthrough beyond current ACP tool-call updates
-- MCP server configuration exposure in the public API
 - Non-interactive authentication flow
 - Structured output helpers or schema validation
 
@@ -53,7 +54,7 @@ Both binaries must be authenticated before use via their normal login flow.
 
 ```elisp
 (straight-use-package
- '(acp-bridge :host github :repo "LuciusChen/llm-acp"
+ '(acp-bridge :host github :repo "LuciusChen/acp-bridge"
               :files ("acp-bridge.el")))
 ```
 
@@ -93,6 +94,7 @@ Full signature:
   cwd                       ; nil = auto-detect from project root
   system-prompt             ; appended to agent system prompt on session/new
   new-session               ; if t: clear stored session first
+  mcp-servers               ; list of MCP server alists, passed to session/new and session/resume
   on-chunk                  ; (lambda (accumulated-text))
   on-event                  ; (lambda (raw-session-update-params))
   on-tool-call              ; (lambda (merged-tool-call-state))
@@ -101,31 +103,73 @@ Full signature:
   on-error)                 ; (lambda (kind msg))
 ```
 
-For tool-call updates, `:on-tool-call` receives a plist with fields such as:
+### MCP servers
 
-- `:type` -> `:tool-call`
-- `:session-id`
-- `:tool-call-id`
-- `:title`
-- `:kind`
-- `:status`
-- `:raw-input`
-- `:raw-output`
-- `:content`
-- `:update-kind`
-- `:delta`
+```elisp
+(acp-bridge-request "List the open issues"
+  :app 'my-tool
+  :mcp-servers '(((name . "github") (command . "/usr/local/bin/github-mcp")))
+  :on-done (lambda (text) (message "%s" text)))
+```
 
-For `session/request_permission`, `:on-request` receives a plist with:
+### File system capabilities
 
-- `:type` -> `:permission-request`
-- `:session-id`
-- `:request-id`
-- `:tool-call`
-- `:options`
-- `:respond` -> function taking an `option-id`
-- `:cancel` -> function taking no arguments
+When you enable file capabilities, the agent can read (and optionally write) files from the Emacs host:
 
-If no `:on-request` callback is provided, permission requests are auto-cancelled so the agent does not hang waiting for a client response.
+```elisp
+;; Allow the agent to read files via Emacs I/O (auto-handled by bridge)
+(setq acp-bridge-fs-read-capability t)
+
+;; Allow the agent to request file writes (surfaced to :on-request)
+(setq acp-bridge-fs-write-capability t)
+
+;; Handle a write request
+(acp-bridge-request "Refactor the file"
+  :app 'my-tool
+  :on-request (lambda (req)
+                (pcase (plist-get req :type)
+                  (:fs-write
+                   ;; inspect path/content, then allow or reject
+                   (if (y-or-n-p (format "Write %s?" (plist-get req :path)))
+                       (funcall (plist-get req :respond))
+                     (funcall (plist-get req :cancel))))
+                  (:permission-request
+                   (funcall (plist-get req :respond)
+                            (map-elt (aref (plist-get req :options) 0) 'id)))))
+  :on-done (lambda (text) (message "Done: %s" text)))
+```
+
+Capabilities must be set before the first request (they are declared during ACP `initialize`).
+
+### `:on-tool-call` event shape
+
+Each call receives a plist with:
+
+- `:type` → `:tool-call`
+- `:session-id`, `:tool-call-id`
+- `:title`, `:kind`, `:status` (`"in_progress"`, `"completed"`, `"failed"`, `"cancelled"`)
+- `:raw-input`, `:raw-output`, `:content`
+- `:update-kind` (`"tool_call"` or `"tool_call_update"`)
+- `:delta` — the raw ACP update payload
+
+### `:on-request` event shapes
+
+**Permission request** (`session/request_permission`):
+
+- `:type` → `:permission-request`
+- `:session-id`, `:request-id`
+- `:tool-call`, `:options`
+- `:respond` → `(lambda (option-id))`
+- `:cancel` → `(lambda ())`
+
+**File write request** (`fs/write_text_file`, when `acp-bridge-fs-write-capability` is `t`):
+
+- `:type` → `:fs-write`
+- `:request-id`, `:path`, `:content`
+- `:respond` → `(lambda ())` — writes the file and confirms
+- `:cancel` → `(lambda ())` — rejects the write
+
+If no `:on-request` callback is provided, permission requests are auto-cancelled and file-write requests are auto-rejected.
 
 ## Session Model
 
@@ -153,6 +197,10 @@ These commands manage persisted sessions; they are not a chat UI.
 ```elisp
 (setq acp-bridge-claude-command '("claude-agent-acp"))
 (setq acp-bridge-codex-command  '("codex-acp"))
+
+;; File system capabilities (must be set before first request)
+(setq acp-bridge-fs-read-capability  t)   ; agent can read files via Emacs I/O
+(setq acp-bridge-fs-write-capability t)   ; agent file-write requests surfaced to :on-request
 ```
 
 ## How It Works
@@ -192,35 +240,19 @@ It is not a drop-in replacement for model HTTP APIs when you need:
 
 Near-term work for broader API-replacement scenarios:
 
-- expose `mcpServers` and client capabilities in the request API
-- add higher-level helpers for stateless calls and structured output
+- add higher-level helpers for stateless calls and structured output (Phase 3)
 
 ## Implementation Checklist
 
-Suggested build order:
-
 - [x] Add `:on-event` callback support and expose raw ACP `session/update` payloads
-- [x] Add `:on-tool-call` with merged tool-call state
+- [x] Add `:on-tool-call` with merged tool-call state (concurrent calls, all terminal states)
 - [x] Subscribe to ACP incoming requests and surface `session/request_permission`
 - [x] Extend the pending-request state so text callbacks and event callbacks can coexist
-- [ ] Expose optional `mcp-servers` and client capability settings in `acp-bridge-request`
+- [x] Expose `:mcp-servers` in `acp-bridge-request`
+- [x] Expose `acp-bridge-fs-read-capability` and `acp-bridge-fs-write-capability`
+- [x] Auto-handle `fs/read_text_file`; surface `fs/write_text_file` to caller
 - [ ] Add a clearer single-turn helper for fresh-session requests
 - [ ] Add optional helpers for JSON-only / structured-output flows
-
-Milestone 1: Event passthrough
-
-- Goal: caller can observe tool-call-related ACP events, not just final text
-- Outcome: enough to start replacing simple function-calling style local integrations
-
-Milestone 2: Host capability exposure
-
-- Goal: caller can opt into ACP client capabilities and MCP server wiring
-- Outcome: bridge can participate in richer ACP workflows instead of only text prompting
-
-Milestone 3: API ergonomics
-
-- Goal: request modes and structured helpers are easy to consume from Elisp
-- Outcome: packages can replace ad hoc direct model API calls with less glue code
 
 ## License
 
