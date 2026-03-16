@@ -402,6 +402,253 @@ acp-fakes' inline dispatch reaches acp-bridge handlers."
                                      '(:result outcome outcome))
                      "cancelled")))))
 
+;;; ── integration: tool-call lifecycle ────────────────────────────────────────
+
+(defvar acp-bridge-test--concurrent-tool-calls-messages
+  `(((:direction . outgoing) (:kind . request)
+     (:object . ((id . 1) (method . "session/new"))))
+    ((:direction . incoming) (:kind . response)
+     (:object . ((id . 1) (result . ((sessionId . "sid-CC"))))))
+    ((:direction . outgoing) (:kind . request)
+     (:object . ((id . 2) (method . "session/prompt"))))
+    ((:direction . incoming) (:kind . notification)
+     (:object . ((method . "session/update")
+                 (params . ((sessionId . "sid-CC")
+                            (update . ((sessionUpdate . "tool_call")
+                                       (toolCallId . "tool-1")
+                                       (title . "Search")
+                                       (status . "in_progress"))))))))
+    ((:direction . incoming) (:kind . notification)
+     (:object . ((method . "session/update")
+                 (params . ((sessionId . "sid-CC")
+                            (update . ((sessionUpdate . "tool_call")
+                                       (toolCallId . "tool-2")
+                                       (title . "Read file")
+                                       (status . "in_progress"))))))))
+    ((:direction . incoming) (:kind . notification)
+     (:object . ((method . "session/update")
+                 (params . ((sessionId . "sid-CC")
+                            (update . ((sessionUpdate . "tool_call_update")
+                                       (toolCallId . "tool-1")
+                                       (status . "completed")
+                                       (rawOutput . "2 matches"))))))))
+    ((:direction . incoming) (:kind . notification)
+     (:object . ((method . "session/update")
+                 (params . ((sessionId . "sid-CC")
+                            (update . ((sessionUpdate . "tool_call_update")
+                                       (toolCallId . "tool-2")
+                                       (status . "completed")
+                                       (rawOutput . "file contents"))))))))
+    ((:direction . incoming) (:kind . response)
+     (:object . ((id . 2) (result . nil))))))
+
+(ert-deftest acp-bridge-test-concurrent-tool-calls ()
+  "Two concurrent tool calls are tracked independently by toolCallId."
+  (acp-bridge-test--with-clean-state
+    (acp-bridge-test--inject-agent :claude
+                                   (acp-fakes-make-client
+                                    acp-bridge-test--concurrent-tool-calls-messages))
+    (let ((by-id (make-hash-table :test #'equal)))
+      (acp-bridge-request "hi"
+        :app 'test-app
+        :cwd "/tmp/test-project"
+        :on-tool-call (lambda (event)
+                        (puthash (plist-get event :tool-call-id) event by-id))
+        :on-done  (lambda (_text) nil)
+        :on-error (lambda (_k _m) (error "unexpected error")))
+      (let ((t1 (gethash "tool-1" by-id))
+            (t2 (gethash "tool-2" by-id)))
+        (should t1)
+        (should t2)
+        ;; Titles carried from initial tool_call through the update
+        (should (equal (plist-get t1 :title) "Search"))
+        (should (equal (plist-get t2 :title) "Read file"))
+        ;; Each reaches its own completed state independently
+        (should (equal (plist-get t1 :status) "completed"))
+        (should (equal (plist-get t2 :status) "completed"))
+        (should (equal (plist-get t1 :raw-output) "2 matches"))
+        (should (equal (plist-get t2 :raw-output) "file contents"))))))
+
+(defvar acp-bridge-test--partial-update-messages
+  `(((:direction . outgoing) (:kind . request)
+     (:object . ((id . 1) (method . "session/new"))))
+    ((:direction . incoming) (:kind . response)
+     (:object . ((id . 1) (result . ((sessionId . "sid-PU"))))))
+    ((:direction . outgoing) (:kind . request)
+     (:object . ((id . 2) (method . "session/prompt"))))
+    ((:direction . incoming) (:kind . notification)
+     (:object . ((method . "session/update")
+                 (params . ((sessionId . "sid-PU")
+                            (update . ((sessionUpdate . "tool_call")
+                                       (toolCallId . "tool-1")
+                                       (title . "Search")
+                                       (kind . "search")
+                                       (status . "in_progress")
+                                       (rawInput . "rg foo"))))))))
+    ;; Partial update: only status and rawOutput — no title/kind/rawInput
+    ((:direction . incoming) (:kind . notification)
+     (:object . ((method . "session/update")
+                 (params . ((sessionId . "sid-PU")
+                            (update . ((sessionUpdate . "tool_call_update")
+                                       (toolCallId . "tool-1")
+                                       (status . "completed")
+                                       (rawOutput . "3 matches"))))))))
+    ((:direction . incoming) (:kind . response)
+     (:object . ((id . 2) (result . nil))))))
+
+(ert-deftest acp-bridge-test-partial-tool-call-update ()
+  "Partial updates preserve existing fields not included in the delta."
+  (acp-bridge-test--with-clean-state
+    (acp-bridge-test--inject-agent :claude
+                                   (acp-fakes-make-client
+                                    acp-bridge-test--partial-update-messages))
+    (let (latest)
+      (acp-bridge-request "hi"
+        :app 'test-app
+        :cwd "/tmp/test-project"
+        :on-tool-call (lambda (event) (setq latest event))
+        :on-done  (lambda (_text) nil)
+        :on-error (lambda (_k _m) (error "unexpected error")))
+      ;; Fields from the initial tool_call must survive the partial update
+      (should (equal (plist-get latest :title) "Search"))
+      (should (equal (plist-get latest :kind) "search"))
+      (should (equal (plist-get latest :raw-input) "rg foo"))
+      ;; Fields from the partial update are applied
+      (should (equal (plist-get latest :status) "completed"))
+      (should (equal (plist-get latest :raw-output) "3 matches")))))
+
+(defvar acp-bridge-test--failed-tool-call-messages
+  `(((:direction . outgoing) (:kind . request)
+     (:object . ((id . 1) (method . "session/new"))))
+    ((:direction . incoming) (:kind . response)
+     (:object . ((id . 1) (result . ((sessionId . "sid-FL"))))))
+    ((:direction . outgoing) (:kind . request)
+     (:object . ((id . 2) (method . "session/prompt"))))
+    ((:direction . incoming) (:kind . notification)
+     (:object . ((method . "session/update")
+                 (params . ((sessionId . "sid-FL")
+                            (update . ((sessionUpdate . "tool_call")
+                                       (toolCallId . "tool-1")
+                                       (title . "Run command")
+                                       (status . "in_progress"))))))))
+    ((:direction . incoming) (:kind . notification)
+     (:object . ((method . "session/update")
+                 (params . ((sessionId . "sid-FL")
+                            (update . ((sessionUpdate . "tool_call_update")
+                                       (toolCallId . "tool-1")
+                                       (status . "failed")
+                                       (rawOutput . "exit code 1"))))))))
+    ((:direction . incoming) (:kind . response)
+     (:object . ((id . 2) (result . nil))))))
+
+(ert-deftest acp-bridge-test-failed-tool-call ()
+  "Tool call with failed terminal state is surfaced correctly."
+  (acp-bridge-test--with-clean-state
+    (acp-bridge-test--inject-agent :claude
+                                   (acp-fakes-make-client
+                                    acp-bridge-test--failed-tool-call-messages))
+    (let (latest)
+      (acp-bridge-request "hi"
+        :app 'test-app
+        :cwd "/tmp/test-project"
+        :on-tool-call (lambda (event) (setq latest event))
+        :on-done  (lambda (_text) nil)
+        :on-error (lambda (_k _m) (error "unexpected error")))
+      (should (equal (plist-get latest :title) "Run command"))
+      (should (equal (plist-get latest :status) "failed"))
+      (should (equal (plist-get latest :raw-output) "exit code 1")))))
+
+(defvar acp-bridge-test--cancelled-tool-call-messages
+  `(((:direction . outgoing) (:kind . request)
+     (:object . ((id . 1) (method . "session/new"))))
+    ((:direction . incoming) (:kind . response)
+     (:object . ((id . 1) (result . ((sessionId . "sid-CAN"))))))
+    ((:direction . outgoing) (:kind . request)
+     (:object . ((id . 2) (method . "session/prompt"))))
+    ((:direction . incoming) (:kind . notification)
+     (:object . ((method . "session/update")
+                 (params . ((sessionId . "sid-CAN")
+                            (update . ((sessionUpdate . "tool_call")
+                                       (toolCallId . "tool-1")
+                                       (title . "Run tests")
+                                       (status . "in_progress"))))))))
+    ((:direction . incoming) (:kind . notification)
+     (:object . ((method . "session/update")
+                 (params . ((sessionId . "sid-CAN")
+                            (update . ((sessionUpdate . "tool_call_update")
+                                       (toolCallId . "tool-1")
+                                       (status . "cancelled"))))))))
+    ((:direction . incoming) (:kind . response)
+     (:object . ((id . 2) (result . nil))))))
+
+(ert-deftest acp-bridge-test-cancelled-tool-call ()
+  "Tool call with cancelled terminal state is surfaced correctly."
+  (acp-bridge-test--with-clean-state
+    (acp-bridge-test--inject-agent :claude
+                                   (acp-fakes-make-client
+                                    acp-bridge-test--cancelled-tool-call-messages))
+    (let (latest)
+      (acp-bridge-request "hi"
+        :app 'test-app
+        :cwd "/tmp/test-project"
+        :on-tool-call (lambda (event) (setq latest event))
+        :on-done  (lambda (_text) nil)
+        :on-error (lambda (_k _m) (error "unexpected error")))
+      (should (equal (plist-get latest :title) "Run tests"))
+      (should (equal (plist-get latest :status) "cancelled")))))
+
+(defvar acp-bridge-test--late-content-messages
+  `(((:direction . outgoing) (:kind . request)
+     (:object . ((id . 1) (method . "session/new"))))
+    ((:direction . incoming) (:kind . response)
+     (:object . ((id . 1) (result . ((sessionId . "sid-LC"))))))
+    ((:direction . outgoing) (:kind . request)
+     (:object . ((id . 2) (method . "session/prompt"))))
+    ;; Initial call: no content or rawOutput yet
+    ((:direction . incoming) (:kind . notification)
+     (:object . ((method . "session/update")
+                 (params . ((sessionId . "sid-LC")
+                            (update . ((sessionUpdate . "tool_call")
+                                       (toolCallId . "tool-1")
+                                       (title . "Read file")
+                                       (status . "in_progress"))))))))
+    ;; rawOutput arrives in a later update
+    ((:direction . incoming) (:kind . notification)
+     (:object . ((method . "session/update")
+                 (params . ((sessionId . "sid-LC")
+                            (update . ((sessionUpdate . "tool_call_update")
+                                       (toolCallId . "tool-1")
+                                       (rawOutput . "file content here"))))))))
+    ;; content arrives last, alongside status completion
+    ((:direction . incoming) (:kind . notification)
+     (:object . ((method . "session/update")
+                 (params . ((sessionId . "sid-LC")
+                            (update . ((sessionUpdate . "tool_call_update")
+                                       (toolCallId . "tool-1")
+                                       (status . "completed")
+                                       (content . ((text . "summary of file"))))))))))
+    ((:direction . incoming) (:kind . response)
+     (:object . ((id . 2) (result . nil))))))
+
+(ert-deftest acp-bridge-test-late-arriving-content ()
+  "rawOutput and content arriving in later updates are merged into accumulated state."
+  (acp-bridge-test--with-clean-state
+    (acp-bridge-test--inject-agent :claude
+                                   (acp-fakes-make-client
+                                    acp-bridge-test--late-content-messages))
+    (let (latest)
+      (acp-bridge-request "hi"
+        :app 'test-app
+        :cwd "/tmp/test-project"
+        :on-tool-call (lambda (event) (setq latest event))
+        :on-done  (lambda (_text) nil)
+        :on-error (lambda (_k _m) (error "unexpected error")))
+      (should (equal (plist-get latest :title) "Read file"))
+      (should (equal (plist-get latest :status) "completed"))
+      (should (equal (plist-get latest :raw-output) "file content here"))
+      (should (equal (map-nested-elt (plist-get latest :content) '(text))
+                     "summary of file")))))
+
 ;;; ── integration: cancel-session ─────────────────────────────────────────────
 
 (ert-deftest acp-bridge-test-cancel-session ()
