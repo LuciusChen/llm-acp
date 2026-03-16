@@ -380,8 +380,7 @@ When OPTION-ID is non-nil, select that option; otherwise respond as cancelled."
      (t
       (let* ((cmd       (acp-bridge--agent-command agent))
              (client    (acp-make-client :command (car cmd)
-                                         :command-params (cdr cmd)
-                                         :context-buffer (current-buffer)))
+                                         :command-params (cdr cmd)))
              (new-entry (make-acp-bridge--agent-entry
                          :client client :state :initializing
                          :queue  (list thunk))))
@@ -704,45 +703,6 @@ This is a claude-code-acp extension; it has no effect on Codex sessions."
        :on-failure (lambda (err)
                      (message "acp-bridge: set-model failed: %S" err)))
     (user-error "acp-bridge: no active session for '%s @ %s'" (car key) (cdr key))))
-
-;;; ── built-in callers ─────────────────────────────────────────────────────────
-
-(defcustom acp-bridge-commit-agent :claude
-  "Agent used by `acp-bridge-commit'."
-  :type '(choice (const :tag "Claude Code" :claude)
-                 (const :tag "Codex" :codex))
-  :group 'acp-bridge)
-
-(defconst acp-bridge-conventional-commits-prompt
-  "The user provides the result of running `git diff --cached`. You suggest a conventional commit message. Don't add anything else to the response.
-
-Commit message format:
-  <type>[optional scope]: <description>
-
-  [optional body]
-
-  [optional footer(s)]
-
-Types: fix, feat, build, chore, ci, docs, style, refactor, perf, test.
-Use BREAKING CHANGE footer or ! after type/scope for breaking changes.
-feat correlates with MINOR, fix with PATCH, BREAKING CHANGE with MAJOR in SemVer."
-  "System prompt for `acp-bridge-commit'.")
-
-;;;###autoload
-(defun acp-bridge-commit ()
-  "Generate a conventional commit message from staged changes and insert it."
-  (interactive)
-  (require 'magit-git nil t)
-  (let ((diff (string-join (magit-git-lines "diff" "--cached") "\n")))
-    (when (string-empty-p diff)
-      (user-error "No staged changes"))
-    (acp-bridge-query diff
-      :agent        acp-bridge-commit-agent
-      :app          'acp-bridge-commit
-      :system-prompt acp-bridge-conventional-commits-prompt
-      :on-done      (lambda (text) (insert (string-trim text)))
-      :on-error     (lambda (_kind msg)
-                      (message "acp-bridge-commit: %s" msg)))))
 
 (provide 'acp-bridge)
 ;;; acp-bridge.el ends here

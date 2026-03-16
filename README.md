@@ -67,8 +67,14 @@ Then:
 ## Programmatic API
 
 ```elisp
+;; single-turn commit message generator (magit example)
+(acp-bridge-query (string-join (magit-git-lines "diff" "--cached") "\n")
+  :app 'magit
+  :system-prompt "Suggest a Conventional Commits message. Output only the message."
+  :on-done (lambda (text) (insert (string-trim text))))
+
 ;; single-turn (acp-bridge-query always starts a fresh session)
-(acp-bridge-query diff-text
+(acp-bridge-query "Summarize this diff"
   :app 'magit
   :system-prompt "Conventional Commits format only."
   :on-done (lambda (text) (insert text)))
