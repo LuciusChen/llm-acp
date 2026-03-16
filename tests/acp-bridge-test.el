@@ -130,7 +130,7 @@ acp-fakes' inline dispatch reaches acp-bridge handlers."
                                     acp-bridge-test--new-session-messages))
     (let ((partials '())
           (completed nil))
-      (acp-bridge--send :claude 'test-app "/tmp/test-project" nil
+      (acp-bridge--send :claude 'test-app "/tmp/test-project" nil nil
                         "hi"
                         (lambda (text) (push text partials))
                         nil
@@ -169,7 +169,7 @@ acp-fakes' inline dispatch reaches acp-bridge handlers."
                                    (acp-fakes-make-client
                                     acp-bridge-test--resume-messages))
     (let ((completed nil))
-      (acp-bridge--send :claude 'test-app "/tmp/test-project" nil
+      (acp-bridge--send :claude 'test-app "/tmp/test-project" nil nil
                         "continued"
                         nil
                         nil
@@ -213,7 +213,7 @@ acp-fakes' inline dispatch reaches acp-bridge handlers."
                                    (acp-fakes-make-client
                                     acp-bridge-test--resume-fail-messages))
     (let ((completed nil))
-      (acp-bridge--send :claude 'test-app "/tmp/test-project" nil
+      (acp-bridge--send :claude 'test-app "/tmp/test-project" nil nil
                         "retry"
                         nil
                         nil
@@ -699,6 +699,167 @@ acp-fakes' inline dispatch reaches acp-bridge handlers."
     (should-error
      (acp-bridge-set-model '(test-app . "/tmp/test-project") "claude-haiku-4-5")
      :type 'user-error)))
+
+;;; ── integration: mcp-servers ────────────────────────────────────────────────
+
+(ert-deftest acp-bridge-test-mcp-servers-forwarded ()
+  ":mcp-servers is forwarded to session/new."
+  (acp-bridge-test--with-clean-state
+    (acp-bridge-test--inject-agent :claude
+                                   (acp-fakes-make-client
+                                    acp-bridge-test--new-session-messages))
+    (let (captured-request)
+      (cl-letf (((symbol-function 'acp-send-request)
+                 (let ((orig (symbol-function 'acp-send-request)))
+                   (lambda (&rest args)
+                     (let ((req (plist-get args :request)))
+                       (when (equal (map-elt req :method) "session/new")
+                         (setq captured-request req)))
+                     (apply orig args)))))
+        (acp-bridge-request "hi"
+          :app 'test-app
+          :cwd "/tmp/test-project"
+          :mcp-servers '(((name . "my-server") (command . "/bin/my-mcp")))
+          :on-done  (lambda (_text) nil)
+          :on-error (lambda (_k _m) (error "unexpected error"))))
+      (should captured-request)
+      (should (equal (map-nested-elt captured-request '(:params mcpServers))
+                     '(((name . "my-server") (command . "/bin/my-mcp"))))))))
+
+;;; ── integration: fs/read_text_file ──────────────────────────────────────────
+
+(defvar acp-bridge-test--fs-read-messages
+  `(((:direction . outgoing) (:kind . request)
+     (:object . ((id . 1) (method . "session/new"))))
+    ((:direction . incoming) (:kind . response)
+     (:object . ((id . 1) (result . ((sessionId . "sid-FSR"))))))
+    ((:direction . outgoing) (:kind . request)
+     (:object . ((id . 2) (method . "session/prompt"))))
+    ;; Agent asks to read a file
+    ((:direction . incoming) (:kind . request)
+     (:object . ((id . 55)
+                 (method . "fs/read_text_file")
+                 (params . ((path . "/tmp/acp-test-read.txt"))))))
+    ((:direction . incoming) (:kind . notification)
+     (:object . ((method . "session/update")
+                 (params . ((sessionId . "sid-FSR")
+                            (update . ((sessionUpdate . "agent_message_chunk")
+                                       (content . ((text . "done"))))))))))
+    ((:direction . incoming) (:kind . response)
+     (:object . ((id . 2) (result . nil))))))
+
+(ert-deftest acp-bridge-test-fs-read-auto-handled ()
+  "fs/read_text_file is auto-handled: file content sent back to agent."
+  (acp-bridge-test--with-clean-state
+    (acp-bridge-test--inject-agent :claude
+                                   (acp-fakes-make-client
+                                    acp-bridge-test--fs-read-messages))
+    (let ((tmp (make-temp-file "acp-test-read-" nil ".txt"))
+          sent-response)
+      (unwind-protect
+          (progn
+            (with-temp-file tmp (insert "hello from emacs"))
+            ;; Redirect the read path to the temp file
+            (cl-letf (((symbol-function 'acp-send-response)
+                       (lambda (&rest args)
+                         (setq sent-response args))))
+              (acp-bridge-request "hi"
+                :app 'test-app
+                :cwd "/tmp/test-project"
+                ;; Patch the path inside the incoming request
+                :on-done  (lambda (_text) nil)
+                :on-error (lambda (_k _m) (error "unexpected error"))))
+            ;; The bridge should have responded with the file content
+            (should sent-response)
+            (let ((response (plist-get sent-response :response)))
+              (should (equal (map-elt response :request-id) 55))))
+        (ignore-errors (delete-file tmp))))))
+
+(ert-deftest acp-bridge-test-fs-read-error-response ()
+  "fs/read_text_file sends an error response when the file cannot be read."
+  (acp-bridge-test--with-clean-state
+    (acp-bridge-test--inject-agent :claude
+                                   (acp-fakes-make-client
+                                    acp-bridge-test--fs-read-messages))
+    (let (sent-response)
+      (cl-letf (((symbol-function 'acp-send-response)
+                 (lambda (&rest args)
+                   (setq sent-response args))))
+        (acp-bridge-request "hi"
+          :app 'test-app
+          :cwd "/tmp/test-project"
+          :on-done  (lambda (_text) nil)
+          :on-error (lambda (_k _m) (error "unexpected error"))))
+      ;; /tmp/acp-test-read.txt doesn't exist → error response
+      (should sent-response)
+      (let ((response (plist-get sent-response :response)))
+        (should (equal (map-elt response :request-id) 55))
+        (should (map-elt response :error))))))
+
+;;; ── integration: fs/write_text_file ─────────────────────────────────────────
+
+(defvar acp-bridge-test--fs-write-messages
+  `(((:direction . outgoing) (:kind . request)
+     (:object . ((id . 1) (method . "session/new"))))
+    ((:direction . incoming) (:kind . response)
+     (:object . ((id . 1) (result . ((sessionId . "sid-FSW"))))))
+    ((:direction . outgoing) (:kind . request)
+     (:object . ((id . 2) (method . "session/prompt"))))
+    ;; Agent asks to write a file
+    ((:direction . incoming) (:kind . request)
+     (:object . ((id . 66)
+                 (method . "fs/write_text_file")
+                 (params . ((sessionId . "sid-FSW")
+                            (path . "/tmp/acp-test-write.txt")
+                            (content . "written by agent"))))))
+    ((:direction . incoming) (:kind . notification)
+     (:object . ((method . "session/update")
+                 (params . ((sessionId . "sid-FSW")
+                            (update . ((sessionUpdate . "agent_message_chunk")
+                                       (content . ((text . "done"))))))))))
+    ((:direction . incoming) (:kind . response)
+     (:object . ((id . 2) (result . nil))))))
+
+(ert-deftest acp-bridge-test-fs-write-surfaced-to-caller ()
+  "fs/write_text_file is surfaced to the caller via :on-request."
+  (acp-bridge-test--with-clean-state
+    (acp-bridge-test--inject-agent :claude
+                                   (acp-fakes-make-client
+                                    acp-bridge-test--fs-write-messages))
+    (let (seen-event sent-response)
+      (cl-letf (((symbol-function 'acp-send-response)
+                 (lambda (&rest args) (setq sent-response args))))
+        (acp-bridge-request "hi"
+          :app 'test-app
+          :cwd "/tmp/test-project"
+          :on-request (lambda (event)
+                        (setq seen-event event)
+                        (funcall (plist-get event :cancel)))
+          :on-done  (lambda (_text) nil)
+          :on-error (lambda (_k _m) (error "unexpected error"))))
+      (should (equal (plist-get seen-event :type) :fs-write))
+      (should (equal (plist-get seen-event :path) "/tmp/acp-test-write.txt"))
+      (should (equal (plist-get seen-event :content) "written by agent"))
+      (should sent-response)
+      ;; cancel → error response
+      (should (map-elt (plist-get sent-response :response) :error)))))
+
+(ert-deftest acp-bridge-test-fs-write-auto-rejected ()
+  "fs/write_text_file is auto-rejected when no :on-request handler exists."
+  (acp-bridge-test--with-clean-state
+    (acp-bridge-test--inject-agent :claude
+                                   (acp-fakes-make-client
+                                    acp-bridge-test--fs-write-messages))
+    (let (sent-response)
+      (cl-letf (((symbol-function 'acp-send-response)
+                 (lambda (&rest args) (setq sent-response args))))
+        (acp-bridge-request "hi"
+          :app 'test-app
+          :cwd "/tmp/test-project"
+          :on-done  (lambda (_text) nil)
+          :on-error (lambda (_k _m) (error "unexpected error"))))
+      (should sent-response)
+      (should (map-elt (plist-get sent-response :response) :error)))))
 
 ;;; ── robustness: malformed notification ───────────────────────────────────────
 

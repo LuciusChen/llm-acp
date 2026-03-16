@@ -45,6 +45,18 @@
   "File used to persist (app . context) → (agent . session-id) mappings."
   :type 'file :group 'acp-bridge)
 
+(defcustom acp-bridge-fs-read-capability nil
+  "When non-nil, declare fs/read_text_file capability in the ACP initialize request.
+The bridge will automatically serve file-read requests from the agent using
+Emacs file I/O.  Must be set before the first request to take effect."
+  :type 'boolean :group 'acp-bridge)
+
+(defcustom acp-bridge-fs-write-capability nil
+  "When non-nil, declare fs/write_text_file capability in the ACP initialize request.
+Agent file-write requests are surfaced to the caller via :on-request.
+Must be set before the first request to take effect."
+  :type 'boolean :group 'acp-bridge)
+
 ;;; ── session key ─────────────────────────────────────────────────────────────
 
 (defun acp-bridge--compute-context (&optional cwd-override)
@@ -246,6 +258,41 @@ When OPTION-ID is non-nil, select that option; otherwise respond as cancelled."
           :cancel     (lambda ()
                         (acp-bridge--respond-permission client request-id nil)))))
 
+(defun acp-bridge--fs-write-event (client request)
+  "Build a callback event plist for an fs/write_text_file REQUEST on CLIENT."
+  (let* ((request-id (map-elt request 'id))
+         (params     (map-elt request 'params))
+         (path       (map-elt params 'path))
+         (content    (map-elt params 'content)))
+    (list :type       :fs-write
+          :request-id request-id
+          :path       path
+          :content    content
+          :respond    (lambda ()
+                        (condition-case err
+                            (progn
+                              (with-temp-file path (insert content))
+                              (acp-send-response
+                               :client client
+                               :response (acp-make-fs-write-text-file-response
+                                          :request-id request-id)))
+                          (error
+                           (acp-send-response
+                            :client client
+                            :response (acp-make-fs-write-text-file-response
+                                       :request-id request-id
+                                       :error (acp-make-error
+                                               :code -32001
+                                               :message (error-message-string err)))))))
+          :cancel     (lambda ()
+                        (acp-send-response
+                         :client client
+                         :response (acp-make-fs-write-text-file-response
+                                    :request-id request-id
+                                    :error (acp-make-error
+                                            :code -32001
+                                            :message "Write rejected")))))))
+
 (defun acp-bridge--request-handler (client request)
   "Dispatch incoming ACP REQUEST for CLIENT to the correct pending request."
   (condition-case err
@@ -259,6 +306,42 @@ When OPTION-ID is non-nil, select that option; otherwise respond as cancelled."
                         (acp-bridge--pending-request session-id event))
              (acp-bridge--respond-permission client request-id nil)
              (message "acp-bridge: auto-cancelled permission request for session %s"
+                      session-id))))
+        ("fs/read_text_file"
+         (let* ((request-id (map-elt request 'id))
+                (params     (map-elt request 'params))
+                (path       (map-elt params 'path)))
+           (condition-case read-err
+               (acp-send-response
+                :client client
+                :response (acp-make-fs-read-text-file-response
+                           :request-id request-id
+                           :content (with-temp-buffer
+                                      (insert-file-contents path)
+                                      (buffer-string))))
+             (error
+              (acp-send-response
+               :client client
+               :response (acp-make-fs-read-text-file-response
+                          :request-id request-id
+                          :error (acp-make-error
+                                  :code -32001
+                                  :message (format "Cannot read %s: %s"
+                                                   path (error-message-string read-err)))))))))
+        ("fs/write_text_file"
+         (let* ((params     (map-elt request 'params))
+                (request-id (map-elt request 'id))
+                (session-id (map-elt params 'sessionId))
+                (event      (acp-bridge--fs-write-event client request)))
+           (unless (and session-id
+                        (acp-bridge--pending-request session-id event))
+             (acp-send-response
+              :client client
+              :response (acp-make-fs-write-text-file-response
+                         :request-id request-id
+                         :error (acp-make-error :code -32001
+                                                :message "No handler for fs/write_text_file")))
+             (message "acp-bridge: auto-rejected fs/write_text_file for session %s"
                       session-id))))
         (_ nil))
     (error
@@ -317,7 +400,9 @@ When OPTION-ID is non-nil, select that option; otherwise respond as cancelled."
                        :protocol-version 1
                        :client-info '((name    . "acp-bridge")
                                       (title   . "Emacs acp-bridge")
-                                      (version . "0.1.0")))
+                                      (version . "0.1.0"))
+                       :read-text-file-capability  acp-bridge-fs-read-capability
+                       :write-text-file-capability acp-bridge-fs-write-capability)
              :on-success
              (lambda (_)
                (setf (acp-bridge--agent-entry-state new-entry) :ready)
@@ -335,10 +420,11 @@ When OPTION-ID is non-nil, select that option; otherwise respond as cancelled."
 ;;; ── core send ────────────────────────────────────────────────────────────────
 
 (defun acp-bridge--send
-    (agent app cwd system-prompt message
+    (agent app cwd system-prompt mcp-servers message
            on-chunk on-event on-tool-call on-request on-done on-error)
   "Send MESSAGE via AGENT for APP at CWD.
 SYSTEM-PROMPT is appended to the agent system prompt on new sessions.
+MCP-SERVERS is a list of MCP server configurations passed to the session.
 ON-CHUNK is called with accumulated text on each streaming chunk.
 ON-EVENT is called with the raw session/update params payload.
 ON-TOOL-CALL is called with merged tool-call state updates.
@@ -356,21 +442,22 @@ ON-ERROR is called with (kind msg) on failure."
          (if session-id
              (acp-bridge--resume-then-prompt
               client agent app context system-prompt session-id
-              message on-chunk on-event on-tool-call on-request on-done on-error)
+              mcp-servers message on-chunk on-event on-tool-call on-request on-done on-error)
            (acp-bridge--new-session-then-prompt
-            client agent app context system-prompt message
+            client agent app context system-prompt mcp-servers message
             on-chunk on-event on-tool-call on-request on-done on-error)))))))
 
 (defun acp-bridge--new-session-then-prompt
-    (client agent app context system-prompt message
+    (client agent app context system-prompt mcp-servers message
             on-chunk on-event on-tool-call on-request on-done on-error)
   "Create a new ACP session and send MESSAGE as the first prompt."
   (acp-send-request
    :client  client
    :request (acp-make-session-new-request
-             :cwd  context
-             :meta (when system-prompt
-                     `((systemPrompt . ((append . ,system-prompt))))))
+             :cwd         context
+             :mcp-servers mcp-servers
+             :meta        (when system-prompt
+                            `((systemPrompt . ((append . ,system-prompt))))))
    :on-success
    (lambda (response)
      (let ((sid (map-elt response 'sessionId)))
@@ -384,11 +471,12 @@ ON-ERROR is called with (kind msg) on failure."
 
 (defun acp-bridge--resume-then-prompt
     (client agent app context system-prompt session-id
-     message on-chunk on-event on-tool-call on-request on-done on-error)
+     mcp-servers message on-chunk on-event on-tool-call on-request on-done on-error)
   "Resume SESSION-ID and send MESSAGE; fall back to a new session on failure."
   (acp-send-request
    :client  client
-   :request (acp-make-session-resume-request :session-id session-id :cwd context)
+   :request (acp-make-session-resume-request :session-id session-id :cwd context
+                                              :mcp-servers mcp-servers)
    :on-success
    (lambda (_)
      (acp-bridge--do-prompt client session-id message
@@ -398,7 +486,7 @@ ON-ERROR is called with (kind msg) on failure."
    (lambda (_)
      (acp-bridge--session-remove app context)
      (acp-bridge--new-session-then-prompt
-      client agent app context system-prompt message
+      client agent app context system-prompt mcp-servers message
       on-chunk on-event on-tool-call on-request on-done on-error))))
 
 (defun acp-bridge--do-prompt
@@ -426,6 +514,7 @@ ON-ERROR is called with (kind msg) on failure."
                                cwd
                                system-prompt
                                new-session
+                               mcp-servers
                                on-chunk
                                on-event
                                on-tool-call
@@ -442,10 +531,14 @@ CWD           Override for the session context directory.
 SYSTEM-PROMPT String appended to agent system prompt on session creation.
 NEW-SESSION   When non-nil, clear any stored session before sending.
               Useful for single-turn use (e.g. commit messages).
+MCP-SERVERS   List of MCP server configuration alists for the session.
+              Passed to session/new and session/resume.  Example:
+              \\='(((name . \"my-server\") (command . \"/usr/local/bin/my-mcp\")))
 ON-CHUNK      Called with accumulated text string on each streaming chunk.
-ON-EVENT      Called with the raw ACP `session/update' params payload.
+ON-EVENT      Called with the raw ACP `session/update\\=' params payload.
 ON-TOOL-CALL  Called with merged tool-call state updates.
 ON-REQUEST    Called with ACP requests that require a client response.
+              Receives permission-request, fs-write, and similar events.
 ON-DONE       Called with the final text string when response is complete.
 ON-ERROR      Called with (kind msg) on failure."
   (when new-session
@@ -455,7 +548,7 @@ ON-ERROR      Called with (kind msg) on failure."
                                       (when (buffer-live-p buf)
                                         (with-current-buffer buf
                                           (apply fn args)))))))
-      (acp-bridge--send agent app cwd system-prompt message
+      (acp-bridge--send agent app cwd system-prompt mcp-servers message
                         (in-buf on-chunk) (in-buf on-event)
                         (in-buf on-tool-call) (in-buf on-request)
                         (in-buf on-done) (in-buf on-error)))))
