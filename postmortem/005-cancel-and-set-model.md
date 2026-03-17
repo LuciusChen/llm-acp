@@ -55,6 +55,45 @@ on the fake client, or notifications will be silently dropped and the
 Fix: `llm-acp-test--inject-agent` now calls `acp-subscribe-to-notifications`
 before inserting the entry into `llm-acp--agents`.
 
+## Why
+
+### cancel must not end the session
+
+`session/cancel` is an interrupt, not a termination. The ACP session remains
+alive after a cancel: the next `session/prompt` can continue the same
+conversation. Removing the session-id on cancel would force a `session/new` on
+the next send, throwing away the agent's in-memory history. The correct mental
+model is "stop what you're doing, but stay ready" — analogous to `C-g` in
+Emacs: it interrupts the current command but does not close any buffer or
+connection.
+
+### cancel must use a notification, not a request
+
+The ACP spec defines `session/cancel` as a notification because there is
+nothing to respond to: the agent acknowledges the interrupt by stopping, not
+by sending a reply. Registering a pending callback (what `acp-send-request`
+does) would leak memory, since the callback would never fire. The contract
+of `acp-send-notification` — fire-and-forget — exactly matches the protocol
+semantics.
+
+### model selection cannot be enumerable
+
+Model IDs are versioned strings that change with every agent release and are
+not exposed through ACP introspection. Any hardcoded allowlist would be stale
+immediately. The only correct interface is a free-text prompt that accepts any
+string the user knows to be valid. Docstring examples (e.g.
+`claude-opus-4-6`, `claude-haiku-4-5-20251001`) serve as guidance without
+constraining the input.
+
+### condition-case must wrap the whole handler body
+
+A narrow guard (e.g. around only field-extraction calls) would leave callback
+invocation errors unguarded. If an error escapes `llm-acp--notification-handler`,
+it propagates into the process filter and can crash Emacs's handling of the
+underlying stdio process. Wrapping the entire body converts all unhandled errors
+into `(message ...)` output — visible in `*Messages*` for debugging, but
+harmless to the rest of Emacs.
+
 ## Alternatives Considered
 
 **`acp-send-request` for cancel with a no-op `:on-success`** — Rejected.
