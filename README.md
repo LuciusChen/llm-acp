@@ -29,6 +29,7 @@ Implemented:
 - `:mcp-servers` forwarded to `session/new` and `session/resume`
 - `acp-bridge-fs-read-capability`: auto-serve `fs/read_text_file` requests from the agent
 - `acp-bridge-fs-write-capability`: surface `fs/write_text_file` requests to `:on-request`
+- `acp-bridge-httpd`: local OpenAI-compatible HTTP server (gptel, gt.el, llm.el, …)
 
 Not implemented yet:
 
@@ -58,17 +59,17 @@ Both binaries must be authenticated before use via their normal login flow.
  '(acp-bridge :host github :repo "LuciusChen/acp-bridge"
               :files ("acp-bridge.el")))
 
-;; core + gt.el engine
+;; core + HTTP server
 (straight-use-package
  '(acp-bridge :host github :repo "LuciusChen/acp-bridge"
-              :files ("acp-bridge.el" "acp-bridge-gt.el")))
+              :files ("acp-bridge.el" "acp-bridge-httpd.el")))
 ```
 
 Then:
 
 ```elisp
 (require 'acp-bridge)
-(require 'acp-bridge-gt) ; optional, for gt.el integration
+(require 'acp-bridge-httpd) ; optional, for HTTP server
 ```
 
 ## Programmatic API
@@ -283,43 +284,44 @@ It is not a drop-in replacement for model HTTP APIs when you need:
 - service-to-service or multi-tenant backend integration
 - provider-independent request semantics
 
-## gt.el Integration (`acp-bridge-gt.el`)
+## HTTP Server (`acp-bridge-httpd.el`)
 
-`gt-acp-engine` is a [gt.el](https://github.com/lorniu/gt.el) engine that routes
-translation requests through acp-bridge.
+`acp-bridge-httpd` exposes a local OpenAI-compatible endpoint so any tool
+that supports a custom OpenAI API host works without extra adaptation.
 
 ```elisp
-(require 'acp-bridge-gt)
-
-;; basic usage
-(gt-translator
-  :taker   (gt-picker-taker)
-  :engines (gt-acp-engine)
-  :render  (gt-overlay-render))
-
-;; with streaming and Codex
-(gt-translator
-  :taker   (gt-picker-taker)
-  :engines (gt-acp-engine :agent :codex :stream t)
-  :render  (gt-overlay-render))
-
-;; combined with other engines
-(gt-translator
-  :taker   (gt-picker-taker)
-  :engines (list (gt-acp-engine :tag "Claude")
-                 (gt-bing-engine))
-  :render  (gt-overlay-render))
+(require 'acp-bridge-httpd)
+(acp-bridge-httpd-start)   ; starts on port 8765
+(acp-bridge-httpd-stop)    ; stop when done
 ```
 
-`gt-acp-engine` slots:
+Model name mapping: names starting with `"codex"` route to `:codex`; everything
+else routes to `:claude`.
 
-| Slot | Default | Description |
-|------|---------|-------------|
-| `:agent` | `:claude` | ACP agent: `:claude` or `:codex` |
-| `:stream` | `nil` | Stream chunks to renderer (single text only) |
-| `:tag` | `"ACP"` | Label shown in gt.el UI |
+### gptel
 
-Customize the system prompt via `acp-bridge-gt-system-prompt`.
+```elisp
+(gptel-make-openai "acp-bridge"
+  :host     "localhost:8765"
+  :protocol "http"
+  :models   '(claude codex)
+  :key      "ignored")
+```
+
+### gt.el
+
+```elisp
+(setq gt-chatgpt-host "http://localhost:8765"
+      gt-chatgpt-key  "ignored")
+```
+
+### llm.el
+
+```elisp
+(make-llm-openai-compatible
+  :url "http://localhost:8765/v1"
+  :key "ignored")
+```
 
 ## Roadmap
 
@@ -338,7 +340,7 @@ Near-term work for broader API-replacement scenarios:
 - [x] Auto-handle `fs/read_text_file`; surface `fs/write_text_file` to caller
 - [x] Add `acp-bridge-query` single-turn helper
 - [x] Add `acp-bridge-query-json` for JSON-response flows
-- [x] Add `acp-bridge-gt.el` — gt.el engine (`gt-acp-engine`)
+- [x] Add `acp-bridge-httpd.el` — local OpenAI-compatible HTTP server
 
 ## License
 
