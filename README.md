@@ -53,15 +53,22 @@ Both binaries must be authenticated before use via their normal login flow.
 ## Installation
 
 ```elisp
+;; core only
 (straight-use-package
  '(acp-bridge :host github :repo "LuciusChen/acp-bridge"
               :files ("acp-bridge.el")))
+
+;; core + gt.el engine
+(straight-use-package
+ '(acp-bridge :host github :repo "LuciusChen/acp-bridge"
+              :files ("acp-bridge.el" "acp-bridge-gt.el")))
 ```
 
 Then:
 
 ```elisp
 (require 'acp-bridge)
+(require 'acp-bridge-gt) ; optional, for gt.el integration
 ```
 
 ## Programmatic API
@@ -276,6 +283,44 @@ It is not a drop-in replacement for model HTTP APIs when you need:
 - service-to-service or multi-tenant backend integration
 - provider-independent request semantics
 
+## gt.el Integration (`acp-bridge-gt.el`)
+
+`gt-acp-engine` is a [gt.el](https://github.com/lorniu/gt.el) engine that routes
+translation requests through acp-bridge.
+
+```elisp
+(require 'acp-bridge-gt)
+
+;; basic usage
+(gt-translator
+  :taker   (gt-picker-taker)
+  :engines (gt-acp-engine)
+  :render  (gt-overlay-render))
+
+;; with streaming and Codex
+(gt-translator
+  :taker   (gt-picker-taker)
+  :engines (gt-acp-engine :agent :codex :stream t)
+  :render  (gt-overlay-render))
+
+;; combined with other engines
+(gt-translator
+  :taker   (gt-picker-taker)
+  :engines (list (gt-acp-engine :tag "Claude")
+                 (gt-bing-engine))
+  :render  (gt-overlay-render))
+```
+
+`gt-acp-engine` slots:
+
+| Slot | Default | Description |
+|------|---------|-------------|
+| `:agent` | `:claude` | ACP agent: `:claude` or `:codex` |
+| `:stream` | `nil` | Stream chunks to renderer (single text only) |
+| `:tag` | `"ACP"` | Label shown in gt.el UI |
+
+Customize the system prompt via `acp-bridge-gt-system-prompt`.
+
 ## Roadmap
 
 Near-term work for broader API-replacement scenarios:
@@ -293,6 +338,7 @@ Near-term work for broader API-replacement scenarios:
 - [x] Auto-handle `fs/read_text_file`; surface `fs/write_text_file` to caller
 - [x] Add `acp-bridge-query` single-turn helper
 - [x] Add `acp-bridge-query-json` for JSON-response flows
+- [x] Add `acp-bridge-gt.el` — gt.el engine (`gt-acp-engine`)
 
 ## License
 
