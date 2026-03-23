@@ -58,29 +58,22 @@
   "Map MODEL string to an acp-bridge agent keyword."
   (if (and (stringp model) (string-prefix-p "codex" model)) :codex :claude))
 
-(defun acp-bridge-httpd--format-messages (messages)
-  "Convert MESSAGES array into a (prompt . system-prompt) cons cell.
-Single user turn: prompt is the content verbatim.
-Multi-turn: prompt is formatted as a Human/Assistant dialogue so the
-agent receives the full conversation history in one fresh session."
-  (let (sys turns)
+(defun acp-bridge-httpd--parse-messages (messages)
+  "Parse MESSAGES into a plist with keys :prompt :system :new-session.
+:prompt      — content of the last user message
+:system      — first system message content, or nil
+:new-session — t when there is only one user turn (new conversation)"
+  (let (sys last-user (user-count 0))
     (seq-doseq (msg messages)
       (let ((role    (map-elt msg 'role))
             (content (map-elt msg 'content)))
         (cond
-         ((equal role "system")    (unless sys (setq sys content)))
-         ((equal role "user")      (push (cons 'user      content) turns))
-         ((equal role "assistant") (push (cons 'assistant content) turns)))))
-    (setq turns (nreverse turns))
-    (cons
-     (if (and (= (length turns) 1) (eq (caar turns) 'user))
-         (cdar turns)
-       (mapconcat (lambda (turn)
-                    (format "%s: %s"
-                            (if (eq (car turn) 'user) "Human" "Assistant")
-                            (cdr turn)))
-                  turns "\n\n"))
-     sys)))
+         ((equal role "system") (unless sys (setq sys content)))
+         ((equal role "user")   (cl-incf user-count)
+                                (setq last-user content)))))
+    (list :prompt      last-user
+          :system      sys
+          :new-session (= user-count 1))))
 
 (defun acp-bridge-httpd--sse-chunk (content)
   "Format CONTENT as an OpenAI-compatible SSE data line."
@@ -110,11 +103,15 @@ agent receives the full conversation history in one fresh session."
                                             :object-type 'alist
                                             :null-object nil
                                             :false-object nil))
+               (model    (map-elt data 'model))
                (messages (map-elt data 'messages))
-               (agent    (acp-bridge-httpd--model->agent (map-elt data 'model)))
-               (parsed   (acp-bridge-httpd--format-messages messages))
-               (prompt   (car parsed))
-               (sys      (cdr parsed)))
+               (agent    (acp-bridge-httpd--model->agent model))
+               (parsed   (acp-bridge-httpd--parse-messages messages))
+               (prompt   (plist-get parsed :prompt))
+               (sys      (plist-get parsed :system))
+               (new-ses  (plist-get parsed :new-session))
+               (app      (intern (format "acp-bridge-httpd-%s"
+                                         (or model "claude")))))
           (unless (and prompt (not (string-empty-p prompt)))
             (ws-send-500 process "no user message in request"))
           (ws-response-header process 200
@@ -122,11 +119,12 @@ agent receives the full conversation history in one fresh session."
             '("Cache-Control"     . "no-cache")
             '("X-Accel-Buffering" . "no"))
           (let ((prev 0))
-            (acp-bridge-query prompt
+            (acp-bridge-request prompt
               :agent         agent
-              :app           'acp-bridge-httpd
+              :app           app
+              :cwd           "~"
               :system-prompt sys
-              :new-session   t
+              :new-session   new-ses
               :on-chunk
               (lambda (acc)
                 (let ((delta (substring acc prev)))
