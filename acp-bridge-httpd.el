@@ -58,22 +58,29 @@
   "Map MODEL string to an acp-bridge agent keyword."
   (if (and (stringp model) (string-prefix-p "codex" model)) :codex :claude))
 
-(defun acp-bridge-httpd--last-user-message (messages)
-  "Return the content of the last user message in MESSAGES."
-  (let (result)
+(defun acp-bridge-httpd--format-messages (messages)
+  "Convert MESSAGES array into a (prompt . system-prompt) cons cell.
+Single user turn: prompt is the content verbatim.
+Multi-turn: prompt is formatted as a Human/Assistant dialogue so the
+agent receives the full conversation history in one fresh session."
+  (let (sys turns)
     (seq-doseq (msg messages)
-      (when (equal (map-elt msg 'role) "user")
-        (setq result (map-elt msg 'content))))
-    result))
-
-(defun acp-bridge-httpd--system-message (messages)
-  "Return the first system message content in MESSAGES, or nil."
-  (let (result)
-    (seq-doseq (msg messages)
-      (unless result
-        (when (equal (map-elt msg 'role) "system")
-          (setq result (map-elt msg 'content)))))
-    result))
+      (let ((role    (map-elt msg 'role))
+            (content (map-elt msg 'content)))
+        (cond
+         ((equal role "system")    (unless sys (setq sys content)))
+         ((equal role "user")      (push (cons 'user      content) turns))
+         ((equal role "assistant") (push (cons 'assistant content) turns)))))
+    (setq turns (nreverse turns))
+    (cons
+     (if (and (= (length turns) 1) (eq (caar turns) 'user))
+         (cdar turns)
+       (mapconcat (lambda (turn)
+                    (format "%s: %s"
+                            (if (eq (car turn) 'user) "Human" "Assistant")
+                            (cdr turn)))
+                  turns "\n\n"))
+     sys)))
 
 (defun acp-bridge-httpd--sse-chunk (content)
   "Format CONTENT as an OpenAI-compatible SSE data line."
@@ -105,9 +112,10 @@
                                             :false-object nil))
                (messages (map-elt data 'messages))
                (agent    (acp-bridge-httpd--model->agent (map-elt data 'model)))
-               (prompt   (acp-bridge-httpd--last-user-message messages))
-               (sys      (acp-bridge-httpd--system-message messages)))
-          (unless prompt
+               (parsed   (acp-bridge-httpd--format-messages messages))
+               (prompt   (car parsed))
+               (sys      (cdr parsed)))
+          (unless (and prompt (not (string-empty-p prompt)))
             (ws-send-500 process "no user message in request"))
           (ws-response-header process 200
             '("Content-Type"      . "text/event-stream; charset=utf-8")
