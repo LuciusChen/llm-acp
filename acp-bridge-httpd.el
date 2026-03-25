@@ -177,7 +177,7 @@
          :service acp-bridge-httpd-port
          :server  t
          :family  'ipv4
-         :coding  'utf-8
+         :coding  'binary
          :noquery t
          :filter  #'acp-bridge-httpd--filter))
   (message "acp-bridge-httpd: listening on http://localhost:%d" acp-bridge-httpd-port))
